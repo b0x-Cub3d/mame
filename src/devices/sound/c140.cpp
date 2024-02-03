@@ -10,6 +10,11 @@ This chip controls 24 channels (C140) or 16 (219) of PCM.
 16 bytes are associated with each channel.
 Channels can be 8 bit compressed PCM, or 12 bit signed PCM.
 
+2000.06.26  CAB     fixed compressed pcm playback
+2002.07.20  R. Belmont   added support for multiple banking types
+2006.01.08  R. Belmont   added support for NA-1/2 "219" derivative
+2020.05.06  cam900       Implement some features from QuattroPlay sources, by superctr
+
 TODO:
 - What does the INT0 pin do? Normally Namco tied it to VOL0 (with VOL1 = VCC).
 - Acknowledge A9 bit (9th address bit) of host interface
@@ -37,12 +42,7 @@ TODO:
     fully compatible.
 
     Finally, the 219 only has 16 voices.
-*/
-/*
-    2000.06.26  CAB     fixed compressed pcm playback
-    2002.07.20  R. Belmont   added support for multiple banking types
-    2006.01.08  R. Belmont   added support for NA-1/2 "219" derivative
-    2020.05.06  cam900       Implement some features from QuattroPlay sources, by superctr
+    
 */
 
 
@@ -236,11 +236,8 @@ void c140_device::rom_bank_pre_change()
 
 void c140_device::sound_stream_update(sound_stream &stream, std::vector<read_stream_view> const &inputs, std::vector<write_stream_view> &outputs)
 {
-	s32   dt;
-
-	float  pbase = (float)m_baserate * 2.0f / (float)m_sample_rate;
-
-	s16   *lmix, *rmix;
+	float pbase = (float)m_baserate * 2.0f / (float)m_sample_rate;
+	s16  *lmix, *rmix;
 
 	int samples = outputs[0].samples();
 	if (samples > m_sample_rate) samples = m_sample_rate;
@@ -319,7 +316,7 @@ void c140_device::sound_stream_update(sound_stream &stream, std::vector<read_str
 				}
 
 				/* Caclulate the sample value */
-				dt = ((dltdt * offset) >> 16) + prevdt;
+				s32 dt = ((dltdt * offset) >> 16) + prevdt;
 
 				/* Write the data to the sample buffers */
 				*lmix++ += (dt * lvol) >> (5 + 4);
@@ -351,10 +348,8 @@ void c140_device::sound_stream_update(sound_stream &stream, std::vector<read_str
 
 void c219_device::sound_stream_update(sound_stream &stream, std::vector<read_stream_view> const &inputs, std::vector<write_stream_view> &outputs)
 {
-	s32   dt;
 
 	float  pbase = (float)m_baserate * 2.0f / (float)m_sample_rate;
-
 	s16   *lmix, *rmix;
 
 	int samples = outputs[0].samples();
@@ -453,7 +448,7 @@ void c219_device::sound_stream_update(sound_stream &stream, std::vector<read_str
 				}
 
 				/* Caclulate the sample value */
-				dt = ((dltdt * offset) >> 16) + prevdt;
+				s32 dt = ((dltdt * offset) >> 16) + prevdt;
 
 				/* Write the data to the sample buffers */
 				*lmix++ += ((ch_inv_lout(v)) ? -(dt * lvol) : (dt * lvol)) >> (5 + shift);
@@ -498,11 +493,19 @@ inline u8 c140_device::keyon_status_read(u16 offset)
 u8 c140_device::c140_r(offs_t offset)
 {
 	offset &= 0x1ff;
+	u8 data = m_REG[offset];
 
 	if ((offset & 0xf) == 0x5 && offset < 0x180)
-		return keyon_status_read(offset);
+	{
+		data = keyon_status_read(offset);
+	}
+	else if (offset == 0x1f8)
+	{
+		// timer reload value = written reg data + 1
+		data++;
+	}
 
-	return m_REG[offset];
+	return data;
 }
 
 
@@ -547,29 +550,38 @@ void c140_device::c140_w(offs_t offset, u8 data)
 			}
 		}
 	}
-	else if (offset == 0x1fa)
+	else switch (offset)
 	{
-		m_int1_callback(CLEAR_LINE);
+		// timer reload value
+		case 0x1f8:
+			break;
 
-		// timing not verified
-		unsigned div = m_REG[0x1f8] != 0 ? m_REG[0x1f8] : 256;
-		attotime interval = attotime::from_ticks(div * 2, m_baserate);
-		if (BIT(m_REG[0x1fe], 0))
-			m_int1_timer->adjust(interval);
-	}
-	else if (offset == 0x1fe)
-	{
-		if (BIT(data, 0))
-		{
-			// kyukaidk and marvlandj want the first interrupt to happen immediately
-			if (!m_int1_timer->enabled())
-				m_int1_callback(ASSERT_LINE);
-		}
-		else
-		{
+		// set INT1 timer
+		case 0x1fa:
 			m_int1_callback(CLEAR_LINE);
-			m_int1_timer->enable(false);
-		}
+
+			if (BIT(m_REG[0x1fe], 0))
+				m_int1_timer->adjust(attotime::from_ticks((m_REG[0x1f8] + 1) * 2, m_baserate));
+
+			break;
+
+		// enable INT1 timer
+		case 0x1fe:
+			if (BIT(data, 0))
+			{
+				// kyukaidk and marvlandj want the first interrupt to happen immediately
+				if (m_int1_timer->expire().is_never())
+					m_int1_callback(ASSERT_LINE);
+			}
+			else
+			{
+				m_int1_callback(CLEAR_LINE);
+				m_int1_timer->adjust(attotime::never);
+			}
+			break;
+
+		default:
+			break;
 	}
 }
 
@@ -578,12 +590,12 @@ u8 c219_device::c219_r(offs_t offset)
 {
 	offset &= 0x1ff;
 
-	// assume same as c140
 	// TODO: what happens here on reading unmapped voice regs?
+	u8 data = m_REG[offset];
 	if ((offset & 0xf) == 0x5 && offset < 0x100)
 		return keyon_status_read(offset);
 
-	return m_REG[offset];
+	return data;
 }
 
 
